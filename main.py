@@ -507,10 +507,10 @@ class MainWindow(QMainWindow):
         # Table and progress bar in a vertical layout
         table_layout = QVBoxLayout()
         table_layout.setContentsMargins(4, 0, 4, 0)
-        table_layout.setSpacing(0)
+        table_layout.setSpacing(8)  # Add padding between table and progress bar
         self.image_table.setStyleSheet("QTableWidget { border: none; padding: 0; margin: 0; } QHeaderView::section { padding: 0; margin: 0; }")
-        table_layout.addWidget(self.image_table)
-        table_layout.addWidget(self.upload_progress)
+        table_layout.addWidget(self.image_table)      # Table first
+        table_layout.addWidget(self.upload_progress)  # Progress bar below table
         table_widget = QWidget()
         table_widget.setLayout(table_layout)
         self.splitter.addWidget(table_widget)
