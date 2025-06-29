@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QFrame, QGridLayout, QMessageBox, QFileDialog,
                             QLineEdit, QDialog, QListWidget, QListWidgetItem, 
                             QSplitter, QSizePolicy, QMenu, QProgressBar, QTableWidget, QTableWidgetItem, QLayout, QStyle)
-from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal, QObject, QRect, QPoint, QEvent
+from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal, QObject, QRect, QPoint, QEvent, QTimer
 from PyQt6.QtGui import QIcon, QFont, QColor, QPalette, QPixmap, QImage
 import requests
 import json
@@ -25,6 +25,7 @@ from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtCore import QUrl
 from PyQt6.QtWebChannel import QWebChannel
 from PyQt6.QtCore import pyqtSlot
+import time
 
 # Configure logging
 log_dir = "logs"
@@ -458,30 +459,70 @@ class MainWindow(QMainWindow):
         logger.info("Initializing MainWindow")
         self.setWindowTitle("Family Websites Repository Manager")
         self.setMinimumSize(1200, 800)
+        
+        # Add cache for GitHub data
+        self._commit_cache = {}
+        self._content_cache = {}
+        self._rate_limit_remaining = None
+        self._rate_limit_reset = None
+        
+        # Store current gallery HTML
+        self._current_gallery_html = None
+        self._current_repo_name = None
+        
+        # GitHub Pages build tracker
+        self._build_tracker_thread = None
+        self._build_tracker_worker = None
+        self._build_tracking = False
+        
         # Create central widget and main layout
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
-        # Header buttons
+        main_layout.setContentsMargins(0, 0, 0, 0)
+
+        # Create main splitter
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        
+        # First Column (Left)
+        left_widget = QWidget()
+        left_column = QVBoxLayout(left_widget)
+        left_column.setContentsMargins(6, 6, 6, 6)
+        
+        # Buttons layout
         button_layout = QHBoxLayout()
-        # Create repository button
         self.create_repo_btn = QPushButton("Create Repository")
         self.create_repo_btn.clicked.connect(self.create_repository)
-        button_layout.addWidget(self.create_repo_btn)
-        # Header buttons
         refresh_btn = QPushButton("Refresh")
         refresh_btn.clicked.connect(self.refresh_repositories)
+        button_layout.addWidget(self.create_repo_btn)
         button_layout.addWidget(refresh_btn)
-        button_layout.addStretch(1)
-        main_layout.addLayout(button_layout)
-        # Create splitter for left and right panes and make it 20:80 ratio
-        self.splitter = QSplitter(Qt.Orientation.Horizontal)
-        # Left pane: Repository list
+        left_column.addLayout(button_layout)
+        
+        # Repository list
         self.repo_list = QListWidget()
         self.repo_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.repo_list.customContextMenuRequested.connect(self.show_repo_context_menu)
-        self.splitter.addWidget(self.repo_list)
-        # Center pane: Table view
+        self.repo_list.itemDoubleClicked.connect(self.handle_repo_double_click)
+        left_column.addWidget(self.repo_list)
+        
+        # Rate limit section
+        rate_limit_layout = QVBoxLayout()
+        self.rate_limit_label = QLabel()
+        self.rate_limit_label.setStyleSheet("padding: 5px;")
+        self.refresh_rate_limit_btn = QPushButton("Check Rate Limit")
+        self.refresh_rate_limit_btn.setStyleSheet("padding: 2px 10px; margin: 2px;")
+        self.refresh_rate_limit_btn.clicked.connect(self.refresh_rate_limit)
+        rate_limit_layout.addWidget(self.rate_limit_label)
+        rate_limit_layout.addWidget(self.refresh_rate_limit_btn)
+        left_column.addLayout(rate_limit_layout)
+        
+        # Second Column (Center)
+        center_widget = QWidget()
+        center_column = QVBoxLayout(center_widget)
+        center_column.setContentsMargins(6, 6, 6, 6)
+        
+        # Table view
         self.image_table = QTableWidget()
         self.image_table.setColumnCount(5)
         self.image_table.setHorizontalHeaderLabels(["Name", "Size (KB)", "Orig Size (KB)", "SHA", "Date"])
@@ -497,36 +538,77 @@ class MainWindow(QMainWindow):
         header_font.setPointSize(9)
         self.image_table.horizontalHeader().setFont(header_font)
         self.image_table.horizontalHeader().setMinimumHeight(22)
-        # Hide SHA column
         self.image_table.setColumnHidden(3, True)
-        # Add a progress bar below the image list
+        self.image_table.setStyleSheet("QTableWidget { border: none; padding: 0; margin: 0; } QHeaderView::section { padding: 0; margin: 0; }")
+        center_column.addWidget(self.image_table)
+        
+        # Progress bar and upload button layout
+        progress_layout = QHBoxLayout()
         self.upload_progress = QProgressBar()
         self.upload_progress.setVisible(True)
         self.upload_progress.setMinimum(0)
         self.upload_progress.setMaximum(100)
         self.upload_progress.setValue(0)
         self.upload_progress.setFormat('Idle')
-        # Table and progress bar in a vertical layout
-        table_layout = QVBoxLayout()
-        table_layout.setContentsMargins(4, 0, 4, 0)
-        table_layout.setSpacing(8)  # Add padding between table and progress bar
-        self.image_table.setStyleSheet("QTableWidget { border: none; padding: 0; margin: 0; } QHeaderView::section { padding: 0; margin: 0; }")
-        table_layout.addWidget(self.image_table)      # Table first
-        table_layout.addWidget(self.upload_progress)  # Progress bar below table
-        table_widget = QWidget()
-        table_widget.setLayout(table_layout)
-        self.splitter.addWidget(table_widget)
-        # Right pane: HTML Gallery view using QWebEngineView
+        progress_layout.addWidget(self.upload_progress)
+        
+        # Upload button
+        upload_btn = QPushButton("Upload Images")
+        upload_btn.clicked.connect(lambda: self.upload_images_to_repo(self._current_repo_name) if self._current_repo_name else None)
+        progress_layout.addWidget(upload_btn)
+        center_column.addLayout(progress_layout)
+        
+        # Third Column (Right)
+        right_widget = QWidget()
+        right_column = QVBoxLayout(right_widget)
+        right_column.setContentsMargins(6, 6, 6, 6)
+        
+        # Web gallery view
         self.web_gallery = QWebEngineView()
-        self.splitter.addWidget(self.web_gallery)
-        # Set stretch factors to maintain 20:40:40 ratio
-        self.splitter.setStretchFactor(0, 2)  # Left pane gets 20%
-        self.splitter.setStretchFactor(1, 4)  # Table gets 40%
-        self.splitter.setStretchFactor(2, 4)  # Gallery gets 40%
-        main_layout.addWidget(self.splitter)
+        right_column.addWidget(self.web_gallery)
+        
+        # HTML-related buttons
+        html_buttons_layout = QHBoxLayout()
+        save_gallery_btn = QPushButton("Save Gallery Locally")
+        save_gallery_btn.clicked.connect(self.save_gallery_as_html)
+        publish_btn = QPushButton("Publish to GitHub Pages")
+        publish_btn.clicked.connect(lambda: self.publish_to_github_pages(self._current_repo_name) if self._current_repo_name else None)
+        
+        # Build status indicator
+        self.build_status_label = QLabel("Build Status: Not started")
+        self.build_status_label.setStyleSheet("padding: 5px; color: gray; font-size: 11px;")
+        
+        # Manual check button
+        self.check_build_btn = QPushButton("Check Build Status")
+        self.check_build_btn.clicked.connect(self.manual_check_build_status)
+        self.check_build_btn.setEnabled(False)
+        
+        html_buttons_layout.addWidget(save_gallery_btn)
+        html_buttons_layout.addWidget(publish_btn)
+        html_buttons_layout.addWidget(self.build_status_label)
+        html_buttons_layout.addWidget(self.check_build_btn)
+        right_column.addLayout(html_buttons_layout)
+        
+        # Add widgets to splitter
+        self.splitter.addWidget(left_widget)
+        self.splitter.addWidget(center_widget)
+        self.splitter.addWidget(right_widget)
+        
+        # Set stretch factors (20:30:50)
+        self.splitter.setStretchFactor(0, 1)  # 10% for left pane
+        self.splitter.setStretchFactor(1, 2)  # 20% for center pane
+        self.splitter.setStretchFactor(2, 7)  # 70% for right pane
+        
         # Set minimum widths
-        self.image_table.setMinimumWidth(400)
-        self.web_gallery.setMinimumWidth(400)
+        left_widget.setMinimumWidth(250)
+        center_widget.setMinimumWidth(400)
+        right_widget.setMinimumWidth(400)
+        
+        # Add splitter to main layout
+        main_layout.addWidget(self.splitter)
+        
+        # Initialize rate limit display
+        self.update_rate_limit_display()
         # Set default black background for gallery
         self.set_gallery_black_background()
         # Initialize repositories
@@ -536,6 +618,196 @@ class MainWindow(QMainWindow):
         # Add web channel for JavaScript communication
         self.web_channel = QWebChannel()
         self.web_channel.registerObject("backend", self)
+
+    def __del__(self):
+        self.cancel_build_tracking()
+        super().__del__()
+
+    def cancel_build_tracking(self):
+        """Cancel any ongoing build tracking"""
+        if self._build_tracker_worker is not None:
+            self._build_tracker_worker.cancel()
+        if self._build_tracker_thread is not None:
+            try:
+                if self._build_tracker_thread.isRunning():
+                    self._build_tracker_thread.quit()
+                    self._build_tracker_thread.wait()
+            except RuntimeError:
+                # Thread already deleted
+                pass
+        self._build_tracker_thread = None
+        self._build_tracker_worker = None
+        self._build_tracking = False
+
+    def start_build_tracking(self, repo_name):
+        """Start tracking GitHub Pages build status"""
+        self.cancel_build_tracking()
+        
+        # Initialize UI for build tracking
+        self.build_status_label.setText("Build Status: Starting build tracking...")
+        self.build_status_label.setStyleSheet("padding: 5px; color: blue; font-size: 11px;")
+        self.check_build_btn.setEnabled(True)
+        
+        self._build_tracker_thread = QThread()
+        self._build_tracker_worker = GitHubPagesBuildTracker(repo_name)
+        self._build_tracker_worker.moveToThread(self._build_tracker_thread)
+        
+        # Connect signals
+        self._build_tracker_thread.started.connect(self._build_tracker_worker.run)
+        self._build_tracker_worker.build_status_updated.connect(self._on_build_status_updated)
+        self._build_tracker_worker.build_completed.connect(self._on_build_completed)
+        self._build_tracker_worker.finished.connect(self._build_tracker_thread.quit)
+        self._build_tracker_worker.finished.connect(self._build_tracker_worker.deleteLater)
+        self._build_tracker_thread.finished.connect(self._build_tracker_thread.deleteLater)
+        
+        self._build_tracking = True
+        self._build_tracker_thread.start()
+
+    def _on_build_status_updated(self, status, message):
+        """Handle build status updates"""
+        logger.info(f"GitHub Pages build status: {status} - {message}")
+        
+        # Update build status label
+        status_colors = {
+            'building': 'orange',
+            'waiting': 'blue', 
+            'success': 'green',
+            'error': 'red',
+            'timeout': 'red',
+            'unknown': 'gray'
+        }
+        color = status_colors.get(status, 'gray')
+        self.build_status_label.setText(f"Build Status: {message}")
+        self.build_status_label.setStyleSheet(f"padding: 5px; color: {color}; font-size: 11px;")
+        
+        # Enable manual check button
+        self.check_build_btn.setEnabled(True)
+        
+        # Update progress bar with status
+        if status == 'building':
+            self.upload_progress.setFormat(f'Building GitHub Pages...')
+            self.upload_progress.setValue(50)  # Show progress
+        elif status == 'waiting':
+            self.upload_progress.setFormat(f'Waiting for build...')
+            self.upload_progress.setValue(25)
+        elif status == 'success':
+            self.upload_progress.setFormat(f'✅ {message}')
+            self.upload_progress.setValue(100)
+        elif status == 'error':
+            self.upload_progress.setFormat(f'❌ {message}')
+            self.upload_progress.setValue(0)
+        elif status == 'timeout':
+            self.upload_progress.setFormat(f'⏰ {message}')
+            self.upload_progress.setValue(0)
+        else:
+            self.upload_progress.setFormat(f'Status: {message}')
+        
+        QApplication.processEvents()
+
+    def _on_build_completed(self, success, url):
+        """Handle build completion"""
+        self._build_tracking = False
+        
+        if success:
+            # Show success message with the URL
+            QMessageBox.information(
+                self,
+                "GitHub Pages Published!",
+                f"Your gallery is now live at:\n{url}\n\nYou can share this link with others!"
+            )
+            
+            # Ask if user wants to open the published page
+            reply = QMessageBox.question(
+                self,
+                "Open Page",
+                "Would you like to open the published gallery in your default browser?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            
+            if reply == QMessageBox.StandardButton.Yes:
+                import webbrowser
+                webbrowser.open(url)
+        else:
+            # Show error message
+            QMessageBox.warning(
+                self,
+                "Build Failed",
+                "GitHub Pages build failed. Please check the repository settings and try again."
+            )
+        
+        # Reset progress bar
+        self.upload_progress.setValue(0)
+        self.upload_progress.setFormat('Ready')
+        QApplication.processEvents()
+
+    def manual_check_build_status(self):
+        """Manually check the current build status"""
+        if not self._current_repo_name:
+            QMessageBox.warning(self, "Warning", "No repository selected.")
+            return
+            
+        try:
+            self.upload_progress.setFormat('Checking build status...')
+            QApplication.processEvents()
+            
+            headers = {
+                'Authorization': f"token {os.getenv('GITHUB_TOKEN')}",
+                'Accept': 'application/vnd.github.v3+json'
+            }
+            
+            pages_url = f'https://api.github.com/repos/lifetime-memories/{self._current_repo_name}/pages'
+            response = requests.get(pages_url, headers=headers, timeout=10)
+            
+            if response.status_code == 200:
+                pages_data = response.json()
+                status = pages_data.get('status', 'unknown')
+                site_url = pages_data.get('html_url', f'https://lifetime-memories.github.io/{self._current_repo_name}')
+                
+                status_messages = {
+                    'built': f'✅ Build completed! Site available at: {site_url}',
+                    'building': '🔄 Site is currently building...',
+                    'errored': f'❌ Build failed: {pages_data.get("error", {}).get("message", "Unknown error")}',
+                    'not_built': '⏳ Build not started yet',
+                    'unknown': f'❓ Unknown status: {status}'
+                }
+                
+                message = status_messages.get(status, f'Status: {status}')
+                self.build_status_label.setText(f"Build Status: {message}")
+                
+                # Set color based on status
+                if status == 'built':
+                    self.build_status_label.setStyleSheet("padding: 5px; color: green; font-size: 11px;")
+                    # Ask if user wants to open the site
+                    reply = QMessageBox.question(
+                        self,
+                        "Site Ready",
+                        f"Your site is ready!\n\n{site_url}\n\nWould you like to open it?",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                    )
+                    if reply == QMessageBox.StandardButton.Yes:
+                        import webbrowser
+                        webbrowser.open(site_url)
+                elif status == 'building':
+                    self.build_status_label.setStyleSheet("padding: 5px; color: orange; font-size: 11px;")
+                elif status == 'errored':
+                    self.build_status_label.setStyleSheet("padding: 5px; color: red; font-size: 11px;")
+                else:
+                    self.build_status_label.setStyleSheet("padding: 5px; color: gray; font-size: 11px;")
+                    
+            elif response.status_code == 404:
+                self.build_status_label.setText("Build Status: GitHub Pages not enabled")
+                self.build_status_label.setStyleSheet("padding: 5px; color: red; font-size: 11px;")
+            else:
+                self.build_status_label.setText(f"Build Status: API Error ({response.status_code})")
+                self.build_status_label.setStyleSheet("padding: 5px; color: red; font-size: 11px;")
+                
+        except Exception as e:
+            logger.exception("Error checking build status")
+            self.build_status_label.setText(f"Build Status: Error - {str(e)}")
+            self.build_status_label.setStyleSheet("padding: 5px; color: red; font-size: 11px;")
+        finally:
+            self.upload_progress.setFormat('Ready')
+            QApplication.processEvents()
 
     def set_gallery_black_background(self):
         self.web_gallery.setHtml('<html><body style="background:#222;"></body></html>', QUrl("about:blank"))
@@ -677,19 +949,194 @@ class MainWindow(QMainWindow):
 
     def show_repo_context_menu(self, position):
         item = self.repo_list.itemAt(position)
+        menu = QMenu()
+        
         if item:
             repo = item.data(Qt.ItemDataRole.UserRole)
             if repo:
-                menu = QMenu()
                 load_action = menu.addAction("Load Images")
                 upload_action = menu.addAction("Upload Images")
+                save_gallery_action = menu.addAction("Save Gallery as HTML")
+                publish_action = menu.addAction("Publish to GitHub Pages")
                 delete_action = menu.addAction("Delete")
+                
                 load_action.triggered.connect(lambda: self._load_images_for_repo(repo['name']))
                 upload_action.triggered.connect(lambda: self.upload_images_to_repo(repo['name']))
+                save_gallery_action.triggered.connect(self.save_gallery_as_html)
+                publish_action.triggered.connect(lambda: self.publish_to_github_pages(repo['name']))
                 delete_action.triggered.connect(lambda: self.delete_repository(repo['name']))
-                menu.exec(self.repo_list.mapToGlobal(position))
+        else:
+            # Context menu for empty area
+            refresh_action = menu.addAction("Refresh")
+            create_action = menu.addAction("Create Repository")
+            
+            refresh_action.triggered.connect(self.refresh_repositories)
+            create_action.triggered.connect(self.create_repository)
+                
+            menu.exec(self.repo_list.mapToGlobal(position))
+
+    def publish_to_github_pages(self, repo_name):
+        """Publish the gallery to GitHub Pages"""
+        if not self._current_gallery_html:
+            QMessageBox.warning(self, "Warning", "Please load the repository images first.")
+            return
+
+        try:
+            self.upload_progress.setValue(0)
+            self.upload_progress.setFormat('Publishing to GitHub Pages...')
+            QApplication.processEvents()
+
+            # First, enable GitHub Pages if not already enabled
+            headers = {
+                'Authorization': f"token {os.getenv('GITHUB_TOKEN')}",
+                'Accept': 'application/vnd.github.v3+json'
+            }
+
+            # Enable GitHub Pages
+            pages_settings = {
+                'source': {
+                    'branch': 'gh-pages',
+                    'path': '/'
+                }
+            }
+            
+            pages_url = f'https://api.github.com/repos/lifetime-memories/{repo_name}/pages'
+            pages_response = requests.post(pages_url, headers=headers, json=pages_settings)
+            
+            # Get the current commit SHA of the default branch
+            repo_response = requests.get(f'https://api.github.com/repos/lifetime-memories/{repo_name}', headers=headers)
+            if repo_response.status_code != 200:
+                raise Exception(f"Failed to get repository info: {repo_response.status_code}")
+            
+            repo_data = repo_response.json()
+            default_branch = repo_data['default_branch']
+            
+            # Get the latest commit SHA
+            branch_response = requests.get(
+                f'https://api.github.com/repos/lifetime-memories/{repo_name}/git/refs/heads/{default_branch}',
+                headers=headers
+            )
+            if branch_response.status_code != 200:
+                raise Exception(f"Failed to get branch info: {branch_response.status_code}")
+            
+            base_sha = branch_response.json()['object']['sha']
+
+            # Create or update gh-pages branch
+            try:
+                # Try to get gh-pages ref
+                gh_pages_response = requests.get(
+                    f'https://api.github.com/repos/lifetime-memories/{repo_name}/git/refs/heads/gh-pages',
+                    headers=headers
+                )
+                gh_pages_exists = gh_pages_response.status_code == 200
+            except:
+                gh_pages_exists = False
+
+            # Create a blob with the HTML content
+            blob_data = {
+                'content': self._current_gallery_html,
+                'encoding': 'utf-8'
+            }
+            blob_response = requests.post(
+                f'https://api.github.com/repos/lifetime-memories/{repo_name}/git/blobs',
+                headers=headers,
+                json=blob_data
+            )
+            if blob_response.status_code != 201:
+                raise Exception(f"Failed to create blob: {blob_response.status_code}")
+            
+            blob_sha = blob_response.json()['sha']
+
+            # Create a tree
+            tree_data = {
+                'base_tree': base_sha,
+                'tree': [{
+                    'path': 'index.html',
+                    'mode': '100644',
+                    'type': 'blob',
+                    'sha': blob_sha
+                }]
+            }
+            tree_response = requests.post(
+                f'https://api.github.com/repos/lifetime-memories/{repo_name}/git/trees',
+                headers=headers,
+                json=tree_data
+            )
+            if tree_response.status_code != 201:
+                raise Exception(f"Failed to create tree: {tree_response.status_code}")
+            
+            tree_sha = tree_response.json()['sha']
+
+            # Create a commit
+            commit_data = {
+                'message': 'Update GitHub Pages',
+                'tree': tree_sha,
+                'parents': [base_sha]
+            }
+            commit_response = requests.post(
+                f'https://api.github.com/repos/lifetime-memories/{repo_name}/git/commits',
+                headers=headers,
+                json=commit_data
+            )
+            if commit_response.status_code != 201:
+                raise Exception(f"Failed to create commit: {commit_response.status_code}")
+            
+            new_commit_sha = commit_response.json()['sha']
+
+            # Create or update the gh-pages branch reference
+            if gh_pages_exists:
+                # Update existing branch
+                ref_data = {
+                    'sha': new_commit_sha,
+                    'force': True
+                }
+                ref_response = requests.patch(
+                    f'https://api.github.com/repos/lifetime-memories/{repo_name}/git/refs/heads/gh-pages',
+                    headers=headers,
+                    json=ref_data
+                )
+            else:
+                # Create new branch
+                ref_data = {
+                    'ref': 'refs/heads/gh-pages',
+                    'sha': new_commit_sha
+                }
+                ref_response = requests.post(
+                    f'https://api.github.com/repos/lifetime-memories/{repo_name}/git/refs',
+                    headers=headers,
+                    json=ref_data
+                )
+
+            if ref_response.status_code not in [200, 201]:
+                raise Exception(f"Failed to update gh-pages branch: {ref_response.status_code}")
+
+            # Content published successfully, now start tracking the build
+            self.upload_progress.setFormat('Content published! Starting build tracking...')
+            self.upload_progress.setValue(25)
+            QApplication.processEvents()
+            
+            # Start the build tracker
+            self.start_build_tracking(repo_name)
+
+        except Exception as e:
+            logger.exception("Error publishing to GitHub Pages")
+            QMessageBox.critical(self, "Error", f"Failed to publish to GitHub Pages: {str(e)}")
+            self.upload_progress.setValue(0)
+            self.upload_progress.setFormat('Ready')
+            QApplication.processEvents()
+
+    def reset_build_status(self):
+        """Reset build status display"""
+        self.build_status_label.setText("Build Status: Not started")
+        self.build_status_label.setStyleSheet("padding: 5px; color: gray; font-size: 11px;")
+        self.check_build_btn.setEnabled(False)
+        self.cancel_build_tracking()
 
     def _load_images_for_repo(self, repo_name):
+        """Load images for a repository and update the gallery view"""
+        # Reset build status for new repository
+        self.reset_build_status()
+        
         self.load_and_display_images(repo_name)
         # Fetch thumbnails and update HTML gallery
         headers = {
@@ -756,6 +1203,8 @@ class MainWindow(QMainWindow):
         for repo in self.repositories:
             item = QListWidgetItem(repo['name'])
             item.setData(Qt.ItemDataRole.UserRole, repo)
+            # Add tooltip to show that double-click loads the repository
+            item.setToolTip("Double-click to load repository")
             self.repo_list.addItem(item)
         # Resize QListWidget to fit contents
         max_width = 0
@@ -767,204 +1216,592 @@ class MainWindow(QMainWindow):
         self.repo_list.setMinimumWidth(max_width + 40)
         self.repo_list.updateGeometry()
 
+    def _check_rate_limit(self, response):
+        """Check and update rate limit info from response headers"""
+        try:
+            self._rate_limit_remaining = int(response.headers.get('X-RateLimit-Remaining', 0))
+            reset_time = int(response.headers.get('X-RateLimit-Reset', 0))
+            self._rate_limit_reset = datetime.fromtimestamp(reset_time)
+            
+            # Update the GUI display
+            self.update_rate_limit_display()
+            
+            if self._rate_limit_remaining < 100:  # Warning threshold
+                reset_time_str = self._rate_limit_reset.strftime('%Y-%m-%d %H:%M:%S')
+                logger.warning(f"GitHub API rate limit low: {self._rate_limit_remaining} remaining, resets at {reset_time_str}")
+                if self._rate_limit_remaining < 10:  # Critical threshold
+                    QMessageBox.warning(self, "Rate Limit Warning", 
+                        f"GitHub API rate limit is very low ({self._rate_limit_remaining} remaining).\n"
+                        f"Limit will reset at {reset_time_str}")
+        except Exception as e:
+            logger.error(f"Error checking rate limit: {e}")
+            self.rate_limit_label.setText("Rate limit: Unknown")
+            self.rate_limit_label.setStyleSheet("padding: 5px; color: gray;")
+
+    def update_rate_limit_display(self):
+        """Update the rate limit display in the status bar"""
+        try:
+            if self._rate_limit_remaining is not None and self._rate_limit_reset is not None:
+                # Calculate time until reset
+                now = datetime.now()
+                time_until_reset = self._rate_limit_reset - now
+                hours = int(time_until_reset.total_seconds() // 3600)
+                minutes = int((time_until_reset.total_seconds() % 3600) // 60)
+                
+                # Format the display text
+                reset_time = self._rate_limit_reset.strftime('%H:%M:%S')
+                display_text = f"API Calls Remaining: {self._rate_limit_remaining} | Resets in: {hours}h {minutes}m (at {reset_time})"
+                
+                # Set color based on remaining limit
+                if self._rate_limit_remaining < 10:
+                    color = "red"
+                elif self._rate_limit_remaining < 100:
+                    color = "orange"
+                else:
+                    color = "green"
+                
+                self.rate_limit_label.setText(display_text)
+                self.rate_limit_label.setStyleSheet(f"padding: 5px; color: {color};")
+            else:
+                self.rate_limit_label.setText("Rate limit: Not yet fetched")
+                self.rate_limit_label.setStyleSheet("padding: 5px; color: gray;")
+        except Exception as e:
+            logger.error(f"Error updating rate limit display: {e}")
+            self.rate_limit_label.setText("Rate limit: Error")
+            self.rate_limit_label.setStyleSheet("padding: 5px; color: red;")
+
+    @pyqtSlot(str, str)
+    def downloadImage(self, url, filename):
+        """Handle image download with native file dialog"""
+        try:
+            # Show save file dialog
+            file_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Save Image As",
+                filename,
+                "JPEG Images (*.jpg *.jpeg);;All Files (*.*)"
+            )
+            
+            if file_path:
+                # Download the image
+                headers = {
+                    'Authorization': f"token {os.getenv('GITHUB_TOKEN')}",
+                    'Accept': 'application/vnd.github.v3+json'
+                }
+                response = requests.get(url, headers=headers, stream=True)
+                
+                if response.status_code == 200:
+                    with open(file_path, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                    QMessageBox.information(self, "Success", "Image downloaded successfully!")
+                else:
+                    QMessageBox.critical(self, "Error", f"Failed to download image: {response.status_code}")
+        except Exception as e:
+            logger.exception("Error downloading image")
+            QMessageBox.critical(self, "Error", f"Failed to download image: {str(e)}")
+
+    def refresh_rate_limit(self):
+        """Manually refresh the rate limit information"""
+        try:
+            self.upload_progress.setFormat('Checking rate limit...')
+            QApplication.processEvents()
+            
+            response = self._make_github_request('https://api.github.com/rate_limit')
+            if response.status_code == 200:
+                rate_data = response.json()
+                self._rate_limit_remaining = rate_data['rate']['remaining']
+                self._rate_limit_reset = datetime.fromtimestamp(rate_data['rate']['reset'])
+                self.update_rate_limit_display()
+                self.upload_progress.setFormat('Rate limit updated')
+            else:
+                logger.error(f"Failed to fetch rate limit. Status code: {response.status_code}")
+                self.upload_progress.setFormat('Failed to update rate limit')
+        except Exception as e:
+            logger.error(f"Error refreshing rate limit: {e}")
+            self.upload_progress.setFormat('Error checking rate limit')
+        finally:
+            QApplication.processEvents()
+            # Reset progress bar after a short delay
+            QTimer.singleShot(2000, lambda: self.upload_progress.setFormat('Idle'))
+
+    def _make_github_request(self, url, headers=None):
+        """Make a GitHub API request with rate limit checking"""
+        if not headers:
+            headers = {
+                'Authorization': f"token {os.getenv('GITHUB_TOKEN')}",
+                'Accept': 'application/vnd.github.v3+json'
+            }
+        
+        try:
+            response = requests.get(url, headers=headers)
+            self._check_rate_limit(response)
+            return response
+        except Exception as e:
+            logger.error(f"Error making GitHub request to {url}: {e}")
+            raise
+
     def load_and_display_images(self, repo_name):
+        self._current_repo_name = repo_name  # Store current repo name
         logger.info(f"Loading images for repository {repo_name} via context menu.")
+        
+        # Reset build status for new repository
+        self.reset_build_status()
+        
         self.set_interactive(False)
         self.image_table.setRowCount(0)
         if not repo_name:
             self.set_interactive(True)
             return
-        headers = {
-            'Authorization': f"token {os.getenv('GITHUB_TOKEN')}",
-            'Accept': 'application/vnd.github.v3+json'
-        }
+        
+        # Reset and show progress bar
+        self.upload_progress.setValue(0)
+        self.upload_progress.setFormat('Fetching repository data...')
+        QApplication.processEvents()
+        
         try:
-            response = requests.get(
-                f'https://api.github.com/repos/lifetime-memories/{repo_name}/contents/thumbnails',
-                headers=headers
+            # Get thumbnails list
+            response = self._make_github_request(
+                f'https://api.github.com/repos/lifetime-memories/{repo_name}/contents/thumbnails'
             )
+            
             if response.status_code == 200:
                 thumbnails = response.json()
                 self._last_thumbnails = thumbnails
                 if thumbnails:
-                    self.image_table.setRowCount(len(thumbnails))
+                    total_images = len(thumbnails)
+                    self.image_table.setRowCount(total_images)
+                    self.upload_progress.setFormat(f'Loading metadata for {total_images} images... %p%')
+                    QApplication.processEvents()
+                    
+                    # Batch fetch original file metadata
+                    orig_files_url = f'https://api.github.com/repos/lifetime-memories/{repo_name}/contents'
+                    orig_response = self._make_github_request(orig_files_url)
+                    if orig_response.status_code == 200:
+                        orig_files = {f['name']: f for f in orig_response.json()}
+                    else:
+                        orig_files = {}
+                    
+                    # Batch fetch commit history for all files
+                    commits_url = f'https://api.github.com/repos/lifetime-memories/{repo_name}/commits'
+                    commits_response = self._make_github_request(f"{commits_url}?per_page=100")
+                    if commits_response.status_code == 200:
+                        commits_data = commits_response.json()
+                        # Create a map of filename to latest commit
+                        file_commits = {}
+                        for commit in commits_data:
+                            if 'files' in commit:
+                                for file in commit['files']:
+                                    filename = file['filename'].split('/')[-1]
+                                    if filename not in file_commits:
+                                        file_commits[filename] = commit['commit']['committer']['date']
+                    else:
+                        file_commits = {}
+                    
                     row = 0
-                    threads = []
+                    completed_images = 0
+                    
                     for thumb in thumbnails:
                         if thumb['type'] == 'file':
-                            name_item = QTableWidgetItem(thumb['name'])
+                            filename = thumb['name']
+                            name_item = QTableWidgetItem(filename)
                             size_kb = thumb['size'] / 1024
                             size_item = QTableWidgetItem(f"{size_kb:.1f}")
-                            orig_size_item = QTableWidgetItem("Loading...")
-                            sha_item = QTableWidgetItem(thumb.get('sha', ''))
-                            date_item = QTableWidgetItem("Loading...")
+                            
+                            # Get original file size from batch request
+                            orig_size_kb = "-"
+                            if filename in orig_files:
+                                orig_size_kb = f"{orig_files[filename]['size'] / 1024:.1f}"
+                            orig_size_item = QTableWidgetItem(str(orig_size_kb))
+                            
+                            # Get commit date from batch request
+                            date_str = "-"
+                            if filename in file_commits:
+                                dt = datetime.fromisoformat(file_commits[filename].replace('Z', '+00:00'))
+                                date_str = dt.strftime('%Y-%m-%d %H:%M')
+                            date_item = QTableWidgetItem(date_str)
+                            
                             self.image_table.setItem(row, 0, name_item)
                             self.image_table.setItem(row, 1, size_item)
                             self.image_table.setItem(row, 2, orig_size_item)
                             self.image_table.setItem(row, 4, date_item)
-                            # Fetch original image size and last commit date for this file
-                            import threading
-                            def fetch_and_set_orig_size_and_date(row_idx, file_name):
-                                import requests
-                                import datetime
-                                # Fetch original image metadata
-                                orig_url = f'https://api.github.com/repos/lifetime-memories/{repo_name}/contents/{file_name}'
-                                try:
-                                    orig_resp = requests.get(orig_url, headers=headers)
-                                    if orig_resp.status_code == 200:
-                                        orig_info = orig_resp.json()
-                                        orig_size_kb = orig_info.get('size', 0) / 1024
-                                        self.image_table.setItem(row_idx, 2, QTableWidgetItem(f"{orig_size_kb:.1f}"))
-                                        self.image_table.resizeColumnToContents(2)
-                                    else:
-                                        self.image_table.setItem(row_idx, 2, QTableWidgetItem("-"))
-                                        self.image_table.resizeColumnToContents(2)
-                                except Exception:
-                                    self.image_table.setItem(row_idx, 2, QTableWidgetItem("-"))
-                                    self.image_table.resizeColumnToContents(2)
-                                # Fetch last commit date for this file (thumbnail)
-                                commits_url = f'https://api.github.com/repos/lifetime-memories/{repo_name}/commits?path=thumbnails/{file_name}&per_page=1'
-                                try:
-                                    resp = requests.get(commits_url, headers=headers)
-                                    if resp.status_code == 200:
-                                        commits = resp.json()
-                                        if commits:
-                                            date_str = commits[0]['commit']['committer']['date']
-                                            dt = datetime.datetime.fromisoformat(date_str.replace('Z', '+00:00'))
-                                            formatted = dt.strftime('%Y-%m-%d %H:%M')
-                                            self.image_table.setItem(row_idx, 4, QTableWidgetItem(formatted))
-                                            self.image_table.resizeColumnToContents(4)
-                                        else:
-                                            self.image_table.setItem(row_idx, 4, QTableWidgetItem("-"))
-                                            self.image_table.resizeColumnToContents(4)
-                                    else:
-                                        self.image_table.setItem(row_idx, 4, QTableWidgetItem("-"))
-                                        self.image_table.resizeColumnToContents(4)
-                                except Exception:
-                                    self.image_table.setItem(row_idx, 4, QTableWidgetItem("-"))
-                                    self.image_table.resizeColumnToContents(4)
-                                # If this is the last thread, re-enable UI and adjust splitter
-                                if row_idx == len(thumbnails) - 1:
-                                    self.set_interactive(True)
-                                    # --- Adjust splitter after table is fully filled ---
-                                    self.web_gallery.setVisible(True)
-                                    if self.image_table.rowCount() > 1 or (self.image_table.rowCount() == 1 and self.image_table.item(0, 0) and self.image_table.item(0, 0).text() != "No images uploaded yet."):
-                                        self.splitter.setStretchFactor(1, 3)  # Table
-                                        self.splitter.setStretchFactor(2, 5)  # Gallery
-                                    else:
-                                        self.splitter.setStretchFactor(1, 4)
-                                        self.splitter.setStretchFactor(2, 4)
-                            t = threading.Thread(target=fetch_and_set_orig_size_and_date, args=(row, thumb['name']), daemon=True)
-                            t.start()
-                            threads.append(t)
+                            
                             row += 1
-                    self.image_table.setRowCount(row)  # In case some are not files
+                    
+                    self.image_table.setRowCount(row)
                     self.image_table.resizeColumnsToContents()
-                    if not threads:
-                        self.set_interactive(True)
-                        # --- Adjust splitter after table is fully filled (no threads case) ---
-                        self.web_gallery.setVisible(True)
-                        if self.image_table.rowCount() > 1 or (self.image_table.rowCount() == 1 and self.image_table.item(0, 0) and self.image_table.item(0, 0).text() != "No images uploaded yet."):
-                            self.splitter.setStretchFactor(1, 3)  # Table
-                            self.splitter.setStretchFactor(2, 5)  # Gallery
-                        else:
-                            self.splitter.setStretchFactor(1, 4)
-                            self.splitter.setStretchFactor(2, 4)
-                else:
-                    self.image_table.setRowCount(1)
-                    self.image_table.setItem(0, 0, QTableWidgetItem("No images uploaded yet."))
-                    self.image_table.setItem(0, 1, QTableWidgetItem(""))
-                    self.image_table.setItem(0, 2, QTableWidgetItem(""))
-                    self.image_table.setItem(0, 4, QTableWidgetItem(""))
-                    self.image_table.resizeColumnsToContents()
+                    
+                    self.upload_progress.setFormat('Loading gallery view...')
+                    QApplication.processEvents()
+                    
                     self.set_interactive(True)
-                    # --- Adjust splitter after table is fully filled (no images case) ---
                     self.web_gallery.setVisible(True)
-                    self.splitter.setStretchFactor(1, 4)
-                    self.splitter.setStretchFactor(2, 4)
+                    if row > 1 or (row == 1 and self.image_table.item(0, 0) and self.image_table.item(0, 0).text() != "No images uploaded yet."):
+                        self.splitter.setStretchFactor(1, 3)
+                        self.splitter.setStretchFactor(2, 5)
+                    else:
+                        self.splitter.setStretchFactor(1, 4)
+                        self.splitter.setStretchFactor(2, 4)
+                    
+                    self.upload_progress.setValue(100)
+                    self.upload_progress.setFormat('Ready')
+                    QApplication.processEvents()
+                else:
+                    self._handle_empty_repository()
             elif response.status_code == 404:
-                self.image_table.setRowCount(1)
-                self.image_table.setItem(0, 0, QTableWidgetItem("No images uploaded yet."))
-                self.image_table.setItem(0, 1, QTableWidgetItem(""))
-                self.image_table.setItem(0, 2, QTableWidgetItem(""))
-                self.image_table.setItem(0, 4, QTableWidgetItem(""))
-                self.image_table.resizeColumnsToContents()
-                self.set_interactive(True)
-                # --- Adjust splitter after table is fully filled (404 case) ---
-                self.web_gallery.setVisible(True)
-                self.splitter.setStretchFactor(1, 4)
-                self.splitter.setStretchFactor(2, 4)
+                self._handle_empty_repository()
             else:
-                error_msg = f"Failed to load images. Status code: {response.status_code}"
-                logger.error(error_msg)
-                QMessageBox.critical(self, "Error", error_msg)
-                self.set_interactive(True)
-                # --- Adjust splitter after table is fully filled (error case) ---
-                self.web_gallery.setVisible(True)
-                self.splitter.setStretchFactor(1, 4)
-                self.splitter.setStretchFactor(2, 4)
+                self._handle_error(f"Failed to load images. Status code: {response.status_code}")
         except Exception as e:
-            logger.exception("Error while loading images")
-            QMessageBox.critical(self, "Error", f"An error occurred: {str(e)}")
-            self.set_interactive(True)
-            # --- Adjust splitter after table is fully filled (exception case) ---
-            self.web_gallery.setVisible(True)
-            self.splitter.setStretchFactor(1, 4)
-            self.splitter.setStretchFactor(2, 4)
+            self._handle_error(f"An error occurred: {str(e)}")
+
+    def _handle_empty_repository(self):
+        """Handle case when repository is empty"""
+        self.image_table.setRowCount(1)
+        self.image_table.setItem(0, 0, QTableWidgetItem("No images uploaded yet."))
+        self.image_table.setItem(0, 1, QTableWidgetItem(""))
+        self.image_table.setItem(0, 2, QTableWidgetItem(""))
+        self.image_table.setItem(0, 4, QTableWidgetItem(""))
+        self.image_table.resizeColumnsToContents()
+        self.set_interactive(True)
+        self.web_gallery.setVisible(True)
+        self.splitter.setStretchFactor(1, 4)
+        self.splitter.setStretchFactor(2, 4)
+        self.upload_progress.setValue(100)
+        self.upload_progress.setFormat('Ready')
+        QApplication.processEvents()
+
+    def _handle_error(self, error_msg):
+        """Handle error cases"""
+        logger.error(error_msg)
+        QMessageBox.critical(self, "Error", error_msg)
+        self.set_interactive(True)
+        self.web_gallery.setVisible(True)
+        self.splitter.setStretchFactor(1, 4)
+        self.splitter.setStretchFactor(2, 4)
+        self.upload_progress.setValue(0)
+        self.upload_progress.setFormat('Error loading images')
+        QApplication.processEvents()
 
     def _generate_gallery_html(self, image_pairs):
         html = '''
         <!DOCTYPE html>
         <html><head><meta charset="utf-8">
-        <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+        <title>Image Gallery</title>
         <style>
-        body { 
+        html, body { 
             background: #222; 
             color: #eee; 
             margin: 0; 
+            padding: 0;
             font-family: sans-serif;
             min-height: 100vh;
-            overflow-y: auto;
+            width: 100%;
+            overflow-x: hidden;
+            box-sizing: border-box;
+        }
+        *, *:before, *:after {
+            box-sizing: inherit;
+        }
+        .gallery-header {
+            padding: 20px;
+            text-align: center;
+            background: rgba(0,0,0,0.4);
+            backdrop-filter: blur(10px);
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            width: 100%;
+            box-sizing: border-box;
+        }
+        .gallery-title {
+            margin: 0;
+            font-size: 24px;
+            color: #fff;
+            word-wrap: break-word;
+            max-width: 100%;
+        }
+        @media (max-width: 600px) {
+            .gallery-header {
+                padding: 20px 16px;
+                min-height: 70px;
+            }
+            .gallery-title {
+                font-size: 22px;
+            }
+        }
+        .gallery-info {
+            margin-top: 10px;
+            font-size: 14px;
+            color: #aaa;
         }
         .gallery-view {
             position: relative;
             min-height: 100vh;
             width: 100%;
+            max-width: 100vw;
+            overflow-x: hidden;
             overflow-y: auto;
+            -webkit-overflow-scrolling: touch;
+            margin: 0;
+            padding: 0;
         }
         .image-view {
             position: fixed;
             top: 0;
             left: 0;
+            right: 0;
+            bottom: 0;
             width: 100%;
             height: 100%;
             display: none;
             background: #222;
             flex-direction: column;
             z-index: 1000;
+            touch-action: manipulation;
+            overflow: hidden;
+        }
+        .image-view.mobile {
+            background: rgba(0, 0, 0, 0.95);
+        }
+        .image-view.mobile .controls-container {
+            display: none !important;
+        }
+        .context-menu {
+            display: none;
+            position: fixed;
+            background: rgba(40, 40, 40, 0.98);
+            backdrop-filter: blur(10px);
+            border-radius: 12px;
+            padding: 8px 0;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+            z-index: 2000;
+        }
+        .context-menu-item {
+            padding: 12px 24px;
+            color: white;
+            font-size: 16px;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+        .context-menu-item:active {
+            background: rgba(255,255,255,0.1);
+        }
+        .gallery-container {
+            width: 100%;
+            max-width: 100vw;
+            margin: 0 auto;
+            padding: 0 24px;
+            box-sizing: border-box;
+            overflow: hidden;
         }
         .masonry { 
             column-count: 10; 
-            column-gap: 12px; 
-            padding: 16px; 
+            column-gap: 8px; 
+            padding: 24px 0;
+            width: 100%;
+            margin: 0 auto;
+            box-sizing: border-box;
         }
         .masonry img { 
             width: 100%; 
-            margin-bottom: 12px; 
-            border-radius: 8px; 
-            box-shadow: 0 2px 8px rgba(0,0,0,0.2); 
+            margin-bottom: 8px; 
+            border-radius: 4px;
+            box-shadow: none;
             display: block; 
             break-inside: avoid; 
             background: #222; 
             cursor: pointer;
-            transition: transform 0.2s;
+            transition: transform 0.15s ease-out;
+            height: auto;
+            vertical-align: middle;
+            max-width: 100%;
         }
         .masonry img:hover {
             transform: scale(1.02);
         }
-        @media (max-width: 1200px) { .masonry { column-count: 7; } }
-        @media (max-width: 900px) { .masonry { column-count: 5; } }
-        @media (max-width: 600px) { .masonry { column-count: 3; } }
+        /* Default desktop layout */
+        .masonry { 
+            column-count: 10;
+            column-gap: 8px;
+            padding: 24px 0;
+        }
+
+        /* Mobile-specific detection */
+        @media only screen 
+        and (max-device-width: 812px)
+        and (-webkit-min-device-pixel-ratio: 2),
+        only screen and (max-device-width: 812px)
+        and (min-resolution: 192dpi) { 
+            .gallery-header {
+                padding: 48px 24px;
+                background: rgba(0,0,0,0.85);
+                backdrop-filter: blur(15px);
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                height: auto;
+                width: 100vw;
+                margin: 0;
+                box-sizing: border-box;
+                box-shadow: 0 2px 20px rgba(0,0,0,0.4);
+            }
+            .gallery-title {
+                font-size: 24px;
+                line-height: 1.3;
+                padding: 0;
+                margin: 0;
+                width: 100%;
+                text-align: center;
+                font-weight: 600;
+                text-shadow: 0 2px 4px rgba(0,0,0,0.3);
+            }
+            .gallery-info {
+                font-size: 20px;
+                margin-top: 24px;
+                opacity: 0.95;
+                width: 100%;
+                text-align: center;
+            }
+            .gallery-container {
+                padding: 15px;
+                width: 100vw;
+                max-width: 100%;
+                margin: 0 auto;
+                box-sizing: border-box;
+                background: #222;
+                display: flex;
+                justify-content: center;
+            }
+            .masonry { 
+                column-count: 2 !important;
+                column-gap: 15px;
+                padding: 0;
+                margin: 0;
+                width: 100%;
+                max-width: 800px;
+            }
+            .masonry img {
+                border-radius: 12px;
+                margin-bottom: 15px;
+                box-shadow: none;
+                transition: none;
+                position: relative;
+                -webkit-tap-highlight-color: transparent;
+            }
+            /* Remove any hover/active effects on mobile */
+            .masonry img:active,
+            .masonry img:hover {
+                transform: none;
+                box-shadow: none;
+            }
+        }
+            .masonry img:active {
+                transform: scale(0.98);
+            }
+            /* Improve touch targets */
+            button {
+                padding: 16px 24px;
+                border-radius: 14px;
+                font-size: 17px;
+                margin: 10px 0;
+                min-height: 54px;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+            }
+            /* Add more breathing room at the bottom */
+            .gallery-view {
+                padding-bottom: 32px;
+            }
+        }
+
+        /* Tablet-specific detection */
+        @media only screen 
+        and (min-device-width: 813px) 
+        and (max-device-width: 1366px)
+        and (-webkit-min-device-pixel-ratio: 1.5) {
+            .masonry { 
+                column-count: 3 !important;
+                column-gap: 8px;
+            }
+            .gallery-container {
+                padding: 0 12px;
+            }
+        }
+
+        /* Desktop and general responsive breakpoints */
+        @media screen and (max-width: 576px) {
+            .masonry { 
+                column-count: 2;
+                column-gap: 6px;
+                padding: 12px 0;
+            }
+            .gallery-container {
+                padding: 0 8px;
+            }
+        }
+        @media screen and (min-width: 577px) and (max-width: 768px) {
+            .masonry { 
+                column-count: 3;
+                column-gap: 6px;
+            }
+            .gallery-container {
+                padding: 0 12px;
+            }
+        }
+        @media screen and (min-width: 769px) and (max-width: 992px) {
+            .masonry { column-count: 4; }
+            .gallery-container { padding: 0 16px; }
+        }
+        @media screen and (min-width: 993px) and (max-width: 1200px) {
+            .masonry { column-count: 5; }
+            .gallery-container { padding: 0 20px; }
+        }
+        @media screen and (min-width: 1201px) and (max-width: 1600px) {
+            .masonry { column-count: 6; }
+        }
+        @media screen and (min-width: 1601px) and (max-width: 1920px) {
+            .masonry { column-count: 8; }
+        }
+        @media screen and (min-width: 1921px) {
+            .masonry { column-count: 10; }
+        }
+
+        /* Touch device optimizations */
+        @media (hover: none) and (pointer: coarse) {
+            .gallery-header {
+                padding: 48px 24px;
+                font-size: 42px;
+            }
+            .gallery-container {
+                padding: 15px;
+                margin: 0 auto;
+                display: flex;
+                justify-content: center;
+            }
+            .masonry {
+                column-count: 2 !important;
+                column-gap: 15px;
+                max-width: 800px;
+            }
+            .masonry img {
+                margin-bottom: 15px;
+                border-radius: 12px;
+                -webkit-tap-highlight-color: transparent;
+            }
+            /* Hide desktop controls on mobile */
+            .controls-container {
+                display: none !important;
+            }
+            /* Only force 2 columns if it's also a small screen */
+            @media (max-width: 576px) {
+                .masonry {
+                    column-count: 2 !important;
+                }
+            }
+        }
 
         /* Custom scrollbar styles */
         ::-webkit-scrollbar {
@@ -988,14 +1825,18 @@ class MainWindow(QMainWindow):
             align-items: center;
             background: rgba(0,0,0,0.4);
             backdrop-filter: blur(10px);
+            flex-wrap: wrap;
+            gap: 8px;
         }
         .viewer-title {
             font-size: 1.2rem;
             margin: 0;
+            word-break: break-all;
         }
         .viewer-buttons {
             display: flex;
-            gap: 12px;
+            gap: 8px;
+            flex-wrap: wrap;
         }
         .viewer-buttons button {
             padding: 8px 16px;
@@ -1006,9 +1847,30 @@ class MainWindow(QMainWindow):
             color: #fff;
             cursor: pointer;
             text-decoration: none;
+            white-space: nowrap;
+            min-width: 44px;
+            min-height: 44px;
+            touch-action: manipulation;
         }
         .viewer-buttons button:hover {
             background: #666;
+        }
+        @media (max-width: 600px) {
+            .viewer-header {
+                padding: 12px;
+            }
+            .viewer-title {
+                font-size: 1rem;
+                width: 100%;
+            }
+            .viewer-buttons {
+                width: 100%;
+                justify-content: center;
+            }
+            .viewer-buttons button {
+                padding: 8px 12px;
+                font-size: 0.9rem;
+            }
         }
         .viewer-content {
             flex: 1;
@@ -1017,33 +1879,86 @@ class MainWindow(QMainWindow):
             align-items: center;
             justify-content: center;
             padding: 20px;
+            -webkit-overflow-scrolling: touch;
+            background: rgba(0, 0, 0, 0.9);
         }
         .viewer-img {
             max-width: 100%;
             max-height: calc(100vh - 120px);
-            border-radius: 8px;
-            box-shadow: 0 4px 16px rgba(0,0,0,0.3);
-            transition: transform 0.2s;
+            border-radius: 4px;
+            box-shadow: none;
+            transition: transform 0.2s ease-out;
+            touch-action: manipulation;
+            background: #222;
+            object-fit: contain;
+        }
+        /* Mobile image viewer styles */
+        @media (hover: none) and (pointer: coarse) {
+            .viewer-content {
+                padding: 0;
+                overflow: hidden;
+                position: relative;
+                width: 100%;
+                height: 100%;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            }
+            .viewer-img {
+                max-height: 100vh;
+                border-radius: 0;
+                object-fit: contain;
+                transform-origin: center center;
+                position: relative;
+                flex-shrink: 0;
+                transition: none;
+            }
+            .image-view.mobile {
+                background: black;
+            }
+            .image-view.mobile .viewer-content {
+                background: black;
+            }
+        }
+        @media (max-width: 600px) {
+            .viewer-content {
+                padding: 12px 24px;  /* Added horizontal padding */
+            }
+            .viewer-img {
+                max-height: calc(100vh - 150px);
+            }
+        }
+        @media (max-width: 400px) {
+            .viewer-content {
+                padding: 8px 16px;  /* Reduced padding for very small screens */
+            }
         }
         </style>
         </head>
         <body>
+        <div class="gallery-header">
+            <h1 class="gallery-title">''' + (self._current_repo_name or 'Image Gallery') + '''</h1>
+        </div>
         <div class="gallery-view">
+            <div class="gallery-container">
             <div class="masonry">
         '''
         for thumb_url, orig_url in image_pairs:
             filename = orig_url.split('/')[-1]
-            html += f'<img src="{thumb_url}" data-orig="{orig_url}" data-filename="{filename}" loading="lazy" onclick="showImage(this)">\n'
+            html += f'<img src="{thumb_url}" data-orig-url="{orig_url}" data-filename="{filename}" loading="lazy" onclick="showImage(\'{orig_url}\', \'{filename}\')">\n'
         html += '''
             </div>
         </div>
-        <div class="image-view">
-            <div class="viewer-header">
+        </div>
+        
+        <div class="image-view" onclick="if(event.target === this) hideImage()">
+            <div class="viewer-header controls-container">
                 <h2 class="viewer-title"></h2>
                 <div class="viewer-buttons">
-                    <button onclick="downloadImage()">Download</button>
-                    <button onclick="zoomIn()">Zoom In</button>
-                    <button onclick="zoomOut()">Zoom Out</button>
+                    <button onclick="event.stopPropagation(); downloadImage()">Download</button>
+                    <button onclick="event.stopPropagation(); zoomIn()">Zoom In</button>
+                    <button onclick="event.stopPropagation(); zoomOut()">Zoom Out</button>
+                    <button onclick="event.stopPropagation(); hideImage()">Close</button>
                     <button onclick="openInNewTab()">Open in New Tab</button>
                     <button onclick="backToGallery()">Back to Gallery</button>
                 </div>
@@ -1052,107 +1967,489 @@ class MainWindow(QMainWindow):
                 <img id="viewerImg" class="viewer-img" src="" />
             </div>
         </div>
+        
         <script>
-        let galleryView = document.querySelector('.gallery-view');
-        let imageView = document.querySelector('.image-view');
-        let viewerImg = document.getElementById('viewerImg');
-        let viewerTitle = document.querySelector('.viewer-title');
-        let currentZoom = 1.0;
-        let currentOrigUrl = '';
-        let currentFilename = '';
-        let backend = null;
-
-        // Initialize Qt WebChannel
-        new QWebChannel(qt.webChannelTransport, function(channel) {
-            backend = channel.objects.backend;
-        });
-
-        function showImage(img) {
-            const origUrl = img.getAttribute('data-orig');
-            const filename = img.getAttribute('data-filename');
+            const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+            let longPressTimer = null;
+            let currentOrigUrl = null;
+            let currentFilename = null;
+            let currentScale = 1;
+            let currentTranslateX = 0;
+            let currentTranslateY = 0;
+            let galleryView = document.querySelector('.gallery-view');
+            let imageView = document.querySelector('.image-view');
+            let viewerImg = document.getElementById('viewerImg');
+            let viewerTitle = document.querySelector('.viewer-title');
             
-            viewerImg.src = origUrl;
-            currentOrigUrl = origUrl;
-            currentFilename = filename;
-            viewerTitle.textContent = filename;
-            currentZoom = 1.0;
-            viewerImg.style.transform = 'scale(1)';
+            // Touch gesture variables for pinch-to-zoom
+            let initialDistance = 0;
+            let initialScale = 1;
+            let initialTranslateX = 0;
+            let initialTranslateY = 0;
+            let isPinching = false;
+            let lastTouchTime = 0;
+            let touchStartX = 0;
+            let touchStartY = 0;
+            let lastTouchX = 0;
+            let lastTouchY = 0;
+            let isPanning = false;
             
-            galleryView.style.display = 'none';
-            imageView.style.display = 'flex';
-        }
-
-        function downloadImage() {
-            if (backend && currentOrigUrl && currentFilename) {
-                backend.downloadImage(currentOrigUrl, currentFilename);
+            function updateImageTransform() {
+                viewerImg.style.transform = `translate(${currentTranslateX}px, ${currentTranslateY}px) scale(${currentScale})`;
             }
-        }
-
-        function backToGallery() {
-            imageView.style.display = 'none';
-            galleryView.style.display = 'block';
-            viewerImg.src = '';
-            currentZoom = 1.0;
-        }
-
-        function zoomIn() {
-            currentZoom += 0.2;
-            viewerImg.style.transform = `scale(${currentZoom})`;
-        }
-
-        function zoomOut() {
-            currentZoom = Math.max(0.2, currentZoom - 0.2);
-            viewerImg.style.transform = `scale(${currentZoom})`;
-        }
-
-        function openInNewTab() {
-            if (currentOrigUrl) {
-                window.open(currentOrigUrl, '_blank');
+            
+            function constrainPan() {
+                const rect = viewerImg.getBoundingClientRect();
+                const containerRect = document.querySelector('.viewer-content').getBoundingClientRect();
+                
+                // Calculate the scaled dimensions
+                const scaledWidth = rect.width * currentScale;
+                const scaledHeight = rect.height * currentScale;
+                
+                // Calculate maximum pan limits
+                const maxPanX = Math.max(0, (scaledWidth - containerRect.width) / 2);
+                const maxPanY = Math.max(0, (scaledHeight - containerRect.height) / 2);
+                
+                // Constrain panning
+                currentTranslateX = Math.max(-maxPanX, Math.min(maxPanX, currentTranslateX));
+                currentTranslateY = Math.max(-maxPanY, Math.min(maxPanY, currentTranslateY));
             }
-        }
-
-        document.addEventListener('keydown', function(e) {
-            if (imageView.style.display === 'flex') {
-                if (e.key === 'Escape') backToGallery();
-                if (e.key === '+') zoomIn();
-                if (e.key === '-') zoomOut();
+            
+            function showImage(origUrl, filename) {
+                currentOrigUrl = origUrl;
+                currentFilename = filename;
+                currentScale = 1;
+                currentTranslateX = 0;
+                currentTranslateY = 0;
+                
+                viewerImg.src = origUrl;
+                viewerTitle.textContent = filename;
+                imageView.style.display = 'flex';
+                
+                // Add to browser history for both mobile and desktop
+                history.pushState({view: 'image', origUrl: origUrl, filename: filename}, filename, '#image');
+                
+                if (isMobile) {
+                    imageView.classList.add('mobile');
+                    document.querySelector('.controls-container').style.display = 'none';
+                    // Reset transform for mobile
+                    updateImageTransform();
+                } else {
+                    imageView.classList.remove('mobile');
+                    document.querySelector('.controls-container').style.display = 'flex';
+                    galleryView.style.display = 'none';
+                }
             }
-        });
+            
+            function hideImage() {
+                imageView.style.display = 'none';
+                currentOrigUrl = null;
+                currentFilename = null;
+                currentScale = 1;
+                currentTranslateX = 0;
+                currentTranslateY = 0;
+                updateImageTransform();
+            }
+            
+            function zoomIn() {
+                const oldScale = currentScale;
+                currentScale = Math.min(currentScale * 1.2, 3);
+                
+                // Adjust translation to zoom towards center
+                const scaleRatio = currentScale / oldScale;
+                currentTranslateX *= scaleRatio;
+                currentTranslateY *= scaleRatio;
+                
+                constrainPan();
+                updateImageTransform();
+            }
+            
+            function zoomOut() {
+                const oldScale = currentScale;
+                currentScale = Math.max(currentScale / 1.2, 0.5);
+                
+                // Adjust translation to zoom towards center
+                const scaleRatio = currentScale / oldScale;
+                currentTranslateX *= scaleRatio;
+                currentTranslateY *= scaleRatio;
+                
+                constrainPan();
+                updateImageTransform();
+            }
+
+            function downloadImage() {
+                if (currentOrigUrl && currentFilename) {
+                    // Call the Python backend to handle download
+                    if (window.backend) {
+                        window.backend.downloadImage(currentOrigUrl, currentFilename);
+                    }
+                }
+            }
+
+            function backToGallery() {
+                imageView.style.display = 'none';
+                galleryView.style.display = 'block';
+                viewerImg.src = '';
+                currentOrigUrl = null;
+                currentFilename = null;
+                currentScale = 1;
+                currentTranslateX = 0;
+                currentTranslateY = 0;
+                updateImageTransform();
+                
+                // Update browser history to go back to gallery
+                if (history.state && history.state.view === 'image') {
+                    history.back();
+                }
+            }
+
+            function openInNewTab() {
+                if (currentOrigUrl) {
+                    window.open(currentOrigUrl, '_blank');
+                }
+            }
+
+            // Calculate distance between two touch points
+            function getDistance(touch1, touch2) {
+                const dx = touch1.clientX - touch2.clientX;
+                const dy = touch1.clientY - touch2.clientY;
+                return Math.sqrt(dx * dx + dy * dy);
+            }
+
+            // Calculate center point between two touches
+            function getTouchCenter(touch1, touch2) {
+                return {
+                    x: (touch1.clientX + touch2.clientX) / 2,
+                    y: (touch1.clientY + touch2.clientY) / 2
+                };
+            }
+
+            // Touch event handlers for pinch-to-zoom and pan
+            function handleTouchStart(e) {
+                if (e.touches.length === 2) {
+                    // Two finger touch - start pinch gesture
+                    isPinching = true;
+                    isPanning = false;
+                    initialDistance = getDistance(e.touches[0], e.touches[1]);
+                    initialScale = currentScale;
+                    initialTranslateX = currentTranslateX;
+                    initialTranslateY = currentTranslateY;
+                    
+                    const center = getTouchCenter(e.touches[0], e.touches[1]);
+                    const rect = viewerImg.getBoundingClientRect();
+                    const containerRect = document.querySelector('.viewer-content').getBoundingClientRect();
+                    
+                    // Calculate touch point relative to image center
+                    touchStartX = center.x - (rect.left + rect.width / 2);
+                    touchStartY = center.y - (rect.top + rect.height / 2);
+                    
+                    e.preventDefault();
+                } else if (e.touches.length === 1) {
+                    // Single touch - start panning or double tap
+                    isPanning = true;
+                    isPinching = false;
+                    lastTouchX = e.touches[0].clientX;
+                    lastTouchY = e.touches[0].clientY;
+                    
+                    const now = Date.now();
+                    if (now - lastTouchTime < 300) {
+                        // Double tap detected
+                        if (currentScale > 1) {
+                            // Reset zoom
+                            currentScale = 1;
+                            currentTranslateX = 0;
+                            currentTranslateY = 0;
+                        } else {
+                            // Zoom in to double tap point
+                            const rect = viewerImg.getBoundingClientRect();
+                            const containerRect = document.querySelector('.viewer-content').getBoundingClientRect();
+                            
+                            // Calculate zoom center relative to image
+                            const zoomCenterX = e.touches[0].clientX - (rect.left + rect.width / 2);
+                            const zoomCenterY = e.touches[0].clientY - (rect.top + rect.height / 2);
+                            
+                            // Zoom in
+                            currentScale = 2;
+                            
+                            // Adjust translation to zoom towards touch point
+                            currentTranslateX = -zoomCenterX * (currentScale - 1);
+                            currentTranslateY = -zoomCenterY * (currentScale - 1);
+                            
+                            constrainPan();
+                        }
+                        updateImageTransform();
+                        e.preventDefault();
+                    }
+                    lastTouchTime = now;
+                }
+            }
+
+            function handleTouchMove(e) {
+                if (isPinching && e.touches.length === 2) {
+                    // Continue pinch gesture
+                    const currentDistance = getDistance(e.touches[0], e.touches[1]);
+                    const scale = currentDistance / initialDistance;
+                    const newScale = Math.max(0.5, Math.min(3, initialScale * scale));
+                    
+                    // Calculate zoom center
+                    const center = getTouchCenter(e.touches[0], e.touches[1]);
+                    const rect = viewerImg.getBoundingClientRect();
+                    const containerRect = document.querySelector('.viewer-content').getBoundingClientRect();
+                    
+                    // Calculate touch point relative to image center
+                    const touchX = center.x - (rect.left + rect.width / 2);
+                    const touchY = center.y - (rect.top + rect.height / 2);
+                    
+                    // Calculate scale change
+                    const scaleChange = newScale / currentScale;
+                    
+                    // Adjust translation to zoom towards touch point
+                    currentTranslateX = touchX - (touchX - currentTranslateX) * scaleChange;
+                    currentTranslateY = touchY - (touchY - currentTranslateY) * scaleChange;
+                    
+                    currentScale = newScale;
+                    constrainPan();
+                    updateImageTransform();
+                    
+                    e.preventDefault();
+                } else if (isPanning && e.touches.length === 1 && currentScale > 1) {
+                    // Pan the image
+                    const deltaX = e.touches[0].clientX - lastTouchX;
+                    const deltaY = e.touches[0].clientY - lastTouchY;
+                    
+                    currentTranslateX += deltaX;
+                    currentTranslateY += deltaY;
+                    
+                    constrainPan();
+                    updateImageTransform();
+                    
+                    lastTouchX = e.touches[0].clientX;
+                    lastTouchY = e.touches[0].clientY;
+                    
+                    e.preventDefault();
+                }
+            }
+
+            function handleTouchEnd(e) {
+                if (isPinching) {
+                    // End pinch gesture
+                    isPinching = false;
+                    initialDistance = 0;
+                    initialScale = 1;
+                }
+                if (isPanning) {
+                    // End panning
+                    isPanning = false;
+                }
+            }
+
+            // Handle browser back button for both mobile and desktop
+            window.addEventListener('popstate', function(e) {
+                if (imageView.style.display === 'flex') {
+                    hideImage();
+                    // Show gallery view on desktop
+                    if (!isMobile) {
+                        galleryView.style.display = 'block';
+                    }
+                }
+            });
+
+            // Set up mobile-specific handlers
+            if (isMobile) {
+                document.addEventListener('DOMContentLoaded', function() {
+                    const images = document.querySelectorAll('.masonry img');
+                    
+                    images.forEach(img => {
+                        // Handle long press for download
+                        img.addEventListener('touchstart', function(e) {
+                            const origUrl = this.getAttribute('data-orig-url');
+                            const filename = this.getAttribute('data-filename');
+                            
+                            longPressTimer = setTimeout(() => {
+                                e.preventDefault();
+                                if (window.backend) {
+                                    window.backend.downloadImage(origUrl, filename);
+                                }
+                            }, 800);
+                        });
+
+                        img.addEventListener('touchend', function() {
+                            if (longPressTimer) {
+                                clearTimeout(longPressTimer);
+                            }
+                        });
+
+                        img.addEventListener('touchmove', function() {
+                            if (longPressTimer) {
+                                clearTimeout(longPressTimer);
+                            }
+                        });
+                    });
+
+                    // Add touch event listeners to the image viewer for pinch-to-zoom and pan
+                    viewerImg.addEventListener('touchstart', handleTouchStart, { passive: false });
+                    viewerImg.addEventListener('touchmove', handleTouchMove, { passive: false });
+                    viewerImg.addEventListener('touchend', handleTouchEnd, { passive: false });
+                });
+            }
+
+            document.addEventListener('keydown', function(e) {
+                if (imageView.style.display === 'flex') {
+                    if (e.key === 'Escape') hideImage();
+                    if (e.key === '+') zoomIn();
+                    if (e.key === '-') zoomOut();
+                }
+            });
         </script>
         </body></html>
         '''
+        # Store the generated HTML
+        self._current_gallery_html = html
         return html
 
-    @pyqtSlot(str, str)
-    def downloadImage(self, url, filename):
-        """Slot to handle image downloads from JavaScript"""
+    def save_gallery_as_html(self):
+        """Save the current gallery view as a standalone HTML file"""
+        if not self._current_gallery_html or not self._current_repo_name:
+            QMessageBox.warning(self, "Warning", "No gallery is currently loaded.")
+            return
+            
         try:
-            # Create a QFileDialog to let user choose where to save
+            # Create a default filename with timestamp
+            default_filename = f"gallery_{self._current_repo_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+            
+            # Show save file dialog
             file_path, _ = QFileDialog.getSaveFileName(
                 self,
-                "Save Image",
-                filename,
-                "JPEG Images (*.jpg *.jpeg);;All Files (*.*)"
+                "Save Gallery as HTML",
+                default_filename,
+                "HTML Files (*.html);;All Files (*.*)"
             )
             
             if file_path:
-                # Download and save the image
-                headers = {
-                    'Authorization': f"token {os.getenv('GITHUB_TOKEN')}",
-                    'Accept': 'application/vnd.github.v3+json'
-                }
-                response = requests.get(url, headers=headers, stream=True)
-                if response.status_code == 200:
-                    with open(file_path, 'wb') as f:
-                        for chunk in response.iter_content(chunk_size=8192):
-                            if chunk:
-                                f.write(chunk)
-                    QMessageBox.information(self, "Success", "Image downloaded successfully!")
-                else:
-                    QMessageBox.critical(self, "Error", f"Failed to download image: {response.status_code}")
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(self._current_gallery_html)
+                QMessageBox.information(self, "Success", "Gallery saved successfully!")
+                
+                # Ask if user wants to open the saved file
+                reply = QMessageBox.question(
+                    self,
+                    "Open File",
+                    "Would you like to open the saved gallery in your default browser?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                
+                if reply == QMessageBox.StandardButton.Yes:
+                    import webbrowser
+                    webbrowser.open(file_path)
+                    
         except Exception as e:
-            logger.exception("Error downloading image")
-            QMessageBox.critical(self, "Error", f"Failed to download image: {str(e)}")
+            logger.exception("Error saving gallery HTML")
+            QMessageBox.critical(self, "Error", f"Failed to save gallery: {str(e)}")
+
+    def handle_repo_double_click(self, item):
+        """Handle double-click on repository list item"""
+        if item:
+            repo = item.data(Qt.ItemDataRole.UserRole)
+            if repo:
+                # Update cursor to show loading state
+                QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+                try:
+                    # Load the repository
+                    self._load_images_for_repo(repo['name'])
+                finally:
+                    # Restore cursor
+                    QApplication.restoreOverrideCursor()
+
+class GitHubPagesBuildTracker(QObject):
+    build_status_updated = pyqtSignal(str, str)  # status, message
+    build_completed = pyqtSignal(bool, str)  # success, url
+    finished = pyqtSignal()
+
+    def __init__(self, repo_name):
+        super().__init__()
+        self.repo_name = repo_name
+        self._is_cancelled = False
+        self.max_attempts = 60  # 5 minutes with 5-second intervals
+        self.attempt_count = 0
+
+    def cancel(self):
+        self._is_cancelled = True
+
+    def run(self):
+        """Monitor GitHub Pages build status"""
+        try:
+            headers = {
+                'Authorization': f"token {os.getenv('GITHUB_TOKEN')}",
+                'Accept': 'application/vnd.github.v3+json'
+            }
+            
+            # Wait a bit for the build to start
+            import time
+            time.sleep(3)
+            
+            while not self._is_cancelled and self.attempt_count < self.max_attempts:
+                try:
+                    # Check GitHub Pages status
+                    pages_url = f'https://api.github.com/repos/lifetime-memories/{self.repo_name}/pages'
+                    response = requests.get(pages_url, headers=headers, timeout=10)
+                    
+                    if response.status_code == 200:
+                        pages_data = response.json()
+                        status = pages_data.get('status', 'unknown')
+                        build_type = pages_data.get('build_type', 'unknown')
+                        
+                        if status == 'built':
+                            # Build completed successfully
+                            site_url = pages_data.get('html_url', f'https://lifetime-memories.github.io/{self.repo_name}')
+                            self.build_status_updated.emit('success', f'Build completed successfully!')
+                            self.build_completed.emit(True, site_url)
+                            break
+                        elif status == 'building':
+                            # Still building
+                            self.build_status_updated.emit('building', f'Building site... (attempt {self.attempt_count + 1}/{self.max_attempts})')
+                        elif status == 'errored':
+                            # Build failed
+                            error_msg = pages_data.get('error', {}).get('message', 'Unknown build error')
+                            self.build_status_updated.emit('error', f'Build failed: {error_msg}')
+                            self.build_completed.emit(False, '')
+                            break
+                        elif status == 'not_built':
+                            # Not built yet
+                            self.build_status_updated.emit('waiting', f'Waiting for build to start... (attempt {self.attempt_count + 1}/{self.max_attempts})')
+                        else:
+                            # Unknown status
+                            self.build_status_updated.emit('unknown', f'Unknown build status: {status}')
+                    
+                    elif response.status_code == 404:
+                        # GitHub Pages not enabled or not found
+                        self.build_status_updated.emit('error', 'GitHub Pages not found or not enabled')
+                        self.build_completed.emit(False, '')
+                        break
+                    else:
+                        # API error
+                        self.build_status_updated.emit('error', f'API error: {response.status_code}')
+                        self.build_completed.emit(False, '')
+                        break
+                        
+                except requests.exceptions.RequestException as e:
+                    self.build_status_updated.emit('error', f'Network error: {str(e)}')
+                    self.build_completed.emit(False, '')
+                    break
+                
+                self.attempt_count += 1
+                time.sleep(5)  # Wait 5 seconds before next check
+            
+            # If we've exhausted all attempts
+            if self.attempt_count >= self.max_attempts and not self._is_cancelled:
+                self.build_status_updated.emit('timeout', 'Build status check timed out. Please check manually.')
+                self.build_completed.emit(False, '')
+                
+        except Exception as e:
+            logger.exception(f"Error in GitHub Pages build tracker: {e}")
+            self.build_status_updated.emit('error', f'Tracker error: {str(e)}')
+            self.build_completed.emit(False, '')
+        finally:
+            self.finished.emit()
 
 def main():
     logger.info("Starting application")
