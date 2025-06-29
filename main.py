@@ -23,6 +23,8 @@ import concurrent.futures
 import traceback
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtCore import QUrl
+from PyQt6.QtWebChannel import QWebChannel
+from PyQt6.QtCore import pyqtSlot
 
 # Configure logging
 log_dir = "logs"
@@ -531,6 +533,10 @@ class MainWindow(QMainWindow):
         self.repositories = []
         self.refresh_repositories()
 
+        # Add web channel for JavaScript communication
+        self.web_channel = QWebChannel()
+        self.web_channel.registerObject("backend", self)
+
     def set_gallery_black_background(self):
         self.web_gallery.setHtml('<html><body style="background:#222;"></body></html>', QUrl("about:blank"))
 
@@ -697,8 +703,16 @@ class MainWindow(QMainWindow):
             )
             if response.status_code == 200:
                 thumbnails = response.json()
-                image_urls = [thumb['download_url'] for thumb in thumbnails if thumb['type'] == 'file']
-                html = self._generate_gallery_html(image_urls)
+                image_pairs = []
+                for thumb in thumbnails:
+                    if thumb['type'] == 'file':
+                        thumb_url = thumb['download_url']
+                        orig_url = thumb_url.replace('/thumbnails/', '/')
+                        image_pairs.append((thumb_url, orig_url))
+                html = self._generate_gallery_html(image_pairs)
+                
+                # Set up web channel before loading HTML
+                self.web_gallery.page().setWebChannel(self.web_channel)
                 self.web_gallery.setHtml(html, QUrl("about:blank"))
             else:
                 self.set_gallery_black_background()
@@ -898,37 +912,247 @@ class MainWindow(QMainWindow):
             self.splitter.setStretchFactor(1, 4)
             self.splitter.setStretchFactor(2, 4)
 
-    def _generate_gallery_html(self, image_urls):
-        # Simple CSS Masonry using columns
+    def _generate_gallery_html(self, image_pairs):
         html = '''
         <!DOCTYPE html>
         <html><head><meta charset="utf-8">
+        <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
         <style>
-        body { background: #222; color: #eee; margin: 0; font-family: sans-serif; }
-        .masonry {
-            column-count: 4;
-            column-gap: 12px;
-            padding: 16px;
+        body { 
+            background: #222; 
+            color: #eee; 
+            margin: 0; 
+            font-family: sans-serif;
+            min-height: 100vh;
+            overflow-y: auto;
         }
-        .masonry img {
+        .gallery-view {
+            position: relative;
+            min-height: 100vh;
             width: 100%;
-            margin-bottom: 12px;
-            border-radius: 8px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.2);
-            display: block;
-            break-inside: avoid;
+            overflow-y: auto;
+        }
+        .image-view {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            display: none;
             background: #222;
+            flex-direction: column;
+            z-index: 1000;
+        }
+        .masonry { 
+            column-count: 10; 
+            column-gap: 12px; 
+            padding: 16px; 
+        }
+        .masonry img { 
+            width: 100%; 
+            margin-bottom: 12px; 
+            border-radius: 8px; 
+            box-shadow: 0 2px 8px rgba(0,0,0,0.2); 
+            display: block; 
+            break-inside: avoid; 
+            background: #222; 
+            cursor: pointer;
+            transition: transform 0.2s;
+        }
+        .masonry img:hover {
+            transform: scale(1.02);
         }
         @media (max-width: 1200px) { .masonry { column-count: 7; } }
         @media (max-width: 900px) { .masonry { column-count: 5; } }
         @media (max-width: 600px) { .masonry { column-count: 3; } }
-        </style></head><body>
-        <div class="masonry">
+
+        /* Custom scrollbar styles */
+        ::-webkit-scrollbar {
+            width: 12px;
+            background: #333;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #666;
+            border-radius: 6px;
+            border: 2px solid #333;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #888;
+        }
+
+        /* Image viewer styles */
+        .viewer-header {
+            padding: 16px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: rgba(0,0,0,0.4);
+            backdrop-filter: blur(10px);
+        }
+        .viewer-title {
+            font-size: 1.2rem;
+            margin: 0;
+        }
+        .viewer-buttons {
+            display: flex;
+            gap: 12px;
+        }
+        .viewer-buttons button {
+            padding: 8px 16px;
+            font-size: 1rem;
+            border-radius: 4px;
+            border: none;
+            background: #444;
+            color: #fff;
+            cursor: pointer;
+            text-decoration: none;
+        }
+        .viewer-buttons button:hover {
+            background: #666;
+        }
+        .viewer-content {
+            flex: 1;
+            overflow: auto;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .viewer-img {
+            max-width: 100%;
+            max-height: calc(100vh - 120px);
+            border-radius: 8px;
+            box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+            transition: transform 0.2s;
+        }
+        </style>
+        </head>
+        <body>
+        <div class="gallery-view">
+            <div class="masonry">
         '''
-        for url in image_urls:
-            html += f'<img src="{url}" loading="lazy" />\n'
-        html += '</div></body></html>'
+        for thumb_url, orig_url in image_pairs:
+            filename = orig_url.split('/')[-1]
+            html += f'<img src="{thumb_url}" data-orig="{orig_url}" data-filename="{filename}" loading="lazy" onclick="showImage(this)">\n'
+        html += '''
+            </div>
+        </div>
+        <div class="image-view">
+            <div class="viewer-header">
+                <h2 class="viewer-title"></h2>
+                <div class="viewer-buttons">
+                    <button onclick="downloadImage()">Download</button>
+                    <button onclick="zoomIn()">Zoom In</button>
+                    <button onclick="zoomOut()">Zoom Out</button>
+                    <button onclick="openInNewTab()">Open in New Tab</button>
+                    <button onclick="backToGallery()">Back to Gallery</button>
+                </div>
+            </div>
+            <div class="viewer-content">
+                <img id="viewerImg" class="viewer-img" src="" />
+            </div>
+        </div>
+        <script>
+        let galleryView = document.querySelector('.gallery-view');
+        let imageView = document.querySelector('.image-view');
+        let viewerImg = document.getElementById('viewerImg');
+        let viewerTitle = document.querySelector('.viewer-title');
+        let currentZoom = 1.0;
+        let currentOrigUrl = '';
+        let currentFilename = '';
+        let backend = null;
+
+        // Initialize Qt WebChannel
+        new QWebChannel(qt.webChannelTransport, function(channel) {
+            backend = channel.objects.backend;
+        });
+
+        function showImage(img) {
+            const origUrl = img.getAttribute('data-orig');
+            const filename = img.getAttribute('data-filename');
+            
+            viewerImg.src = origUrl;
+            currentOrigUrl = origUrl;
+            currentFilename = filename;
+            viewerTitle.textContent = filename;
+            currentZoom = 1.0;
+            viewerImg.style.transform = 'scale(1)';
+            
+            galleryView.style.display = 'none';
+            imageView.style.display = 'flex';
+        }
+
+        function downloadImage() {
+            if (backend && currentOrigUrl && currentFilename) {
+                backend.downloadImage(currentOrigUrl, currentFilename);
+            }
+        }
+
+        function backToGallery() {
+            imageView.style.display = 'none';
+            galleryView.style.display = 'block';
+            viewerImg.src = '';
+            currentZoom = 1.0;
+        }
+
+        function zoomIn() {
+            currentZoom += 0.2;
+            viewerImg.style.transform = `scale(${currentZoom})`;
+        }
+
+        function zoomOut() {
+            currentZoom = Math.max(0.2, currentZoom - 0.2);
+            viewerImg.style.transform = `scale(${currentZoom})`;
+        }
+
+        function openInNewTab() {
+            if (currentOrigUrl) {
+                window.open(currentOrigUrl, '_blank');
+            }
+        }
+
+        document.addEventListener('keydown', function(e) {
+            if (imageView.style.display === 'flex') {
+                if (e.key === 'Escape') backToGallery();
+                if (e.key === '+') zoomIn();
+                if (e.key === '-') zoomOut();
+            }
+        });
+        </script>
+        </body></html>
+        '''
         return html
+
+    @pyqtSlot(str, str)
+    def downloadImage(self, url, filename):
+        """Slot to handle image downloads from JavaScript"""
+        try:
+            # Create a QFileDialog to let user choose where to save
+            file_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Save Image",
+                filename,
+                "JPEG Images (*.jpg *.jpeg);;All Files (*.*)"
+            )
+            
+            if file_path:
+                # Download and save the image
+                headers = {
+                    'Authorization': f"token {os.getenv('GITHUB_TOKEN')}",
+                    'Accept': 'application/vnd.github.v3+json'
+                }
+                response = requests.get(url, headers=headers, stream=True)
+                if response.status_code == 200:
+                    with open(file_path, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                    QMessageBox.information(self, "Success", "Image downloaded successfully!")
+                else:
+                    QMessageBox.critical(self, "Error", f"Failed to download image: {response.status_code}")
+        except Exception as e:
+            logger.exception("Error downloading image")
+            QMessageBox.critical(self, "Error", f"Failed to download image: {str(e)}")
 
 def main():
     logger.info("Starting application")
