@@ -1,130 +1,205 @@
 # Family Websites Repository Manager
 
-A modern desktop application built with Python and PyQt6 for managing image repositories on GitHub. This application provides a user-friendly interface for creating, viewing, and managing image repositories.
+A comprehensive Python application for managing GitHub repositories with image galleries, featuring advanced caching, error handling, and enhanced UI components.
 
-## Features
+## 🚀 Features
 
-- Create new repositories
-- View repository contents
-- Upload images with automatic thumbnail generation
-- Delete repositories
-- **GitHub Pages publishing with real-time build status tracking**
-- Modern dark theme UI
-- Responsive grid layout
-- Progress tracking for uploads
+### Core Functionality
+- **Repository Management**: Create, delete, and manage GitHub repositories
+- **Image Upload**: Bulk upload images with automatic thumbnail generation
+- **Gallery View**: Responsive web-based image gallery with mobile optimization
+- **GitHub Pages Integration**: Automatic publishing to GitHub Pages
+- **Build Tracking**: Real-time monitoring of GitHub Pages build status
 
-## GitHub Pages Features
+### Enhanced Features (New)
+- **Advanced Caching System**: Intelligent caching for improved performance
+- **Comprehensive Error Handling**: Retry logic and user-friendly error messages
+- **Service Layer Architecture**: Clean separation of concerns
+- **Enhanced UI Components**: Modern styling with animations and hover effects
+- **Input Validation**: Robust validation for all user inputs
+- **Performance Optimizations**: Batch operations and concurrent processing
 
-The application includes advanced GitHub Pages functionality:
+## 🏗️ Architecture
 
-- **Automatic Publishing**: Publish your image galleries directly to GitHub Pages
-- **Real-time Build Tracking**: Monitor the build process in real-time with status updates
-- **Build Status Indicator**: Visual indicator showing current build status (building, completed, failed, etc.)
-- **Manual Status Check**: Check build status manually at any time
-- **Automatic Notifications**: Get notified when your site is ready to view
-- **Direct Site Access**: Open your published site directly from the application
+### Service Layer
+- `GitHubService`: Handles all GitHub API operations
+- `ImageService`: Manages image processing and optimization
+- `CacheManager`: Provides intelligent caching for performance
+- `ErrorHandler`: Centralized error handling with retry logic
 
-### Build Status Tracking
+### UI Components
+- `EnhancedButton`: Buttons with hover effects and animations
+- `StatusBar`: Multi-indicator status display
+- `ImageCard`: Enhanced image display cards
+- `LoadingSpinner`: Animated loading indicators
+- `ToolbarWidget`: Organized toolbar with action grouping
 
-When you publish to GitHub Pages, the application will:
+### Configuration
+- Centralized configuration management
+- Environment variable support
+- Configurable settings for all components
 
-1. Upload your gallery content to the repository
-2. Start monitoring the build process automatically
-3. Show real-time status updates in the progress bar and status indicator
-4. Notify you when the build completes successfully
-5. Provide the live URL for your published gallery
+## 📦 Installation
 
-The build tracker will monitor for up to 5 minutes and provide detailed status information including:
-- ✅ Build completed successfully
-- 🔄 Site is currently building
-- ❌ Build failed with error details
-- ⏳ Build not started yet
-- ⏰ Build check timed out
+1. **Clone the repository**:
+   ```bash
+   git clone <repository-url>
+   cd python-software-memory-uploader
+   ```
 
-## Requirements
+2. **Install dependencies**:
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-- Python 3.8 or higher
-- PyQt6
-- requests
-- python-dotenv
-- Pillow
+3. **Set up environment variables**:
+   Create a `.env` file in the project root:
+   ```env
+   GITHUB_TOKEN=your_github_personal_access_token
+   ```
 
-## Installation
+4. **Run the application**:
+   ```bash
+   python main.py
+   ```
 
-1. Clone the repository:
-```bash
-git clone https://github.com/yourusername/repository-manager.git
-cd repository-manager
+## 🔧 Configuration
+
+The application uses a centralized configuration system. Key settings can be modified in `config.py`:
+
+```python
+class Config:
+    # GitHub API Configuration
+    GITHUB_TOKEN = os.getenv('GITHUB_TOKEN')
+    GITHUB_ORG = 'lifetime-memories'
+    
+    # Image Processing
+    THUMBNAIL_SIZE = (200, 200)
+    THUMBNAIL_QUALITY = 85
+    
+    # Caching
+    CACHE_ENABLED = True
+    CACHE_DURATION = 300  # 5 minutes
+    
+    # Rate Limiting
+    RATE_LIMIT_WARNING_THRESHOLD = 100
+    RATE_LIMIT_CRITICAL_THRESHOLD = 10
 ```
 
-2. Create a virtual environment (recommended):
-```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+## 🎯 Usage
+
+### Repository Management
+1. **Create Repository**: Click "Create Repository" and enter a name
+2. **Load Images**: Double-click a repository or use context menu
+3. **Upload Images**: Right-click repository → "Upload Images"
+4. **Delete Repository**: Right-click repository → "Delete"
+
+### Gallery Features
+- **Responsive Design**: Automatically adapts to screen size
+- **Mobile Optimization**: Touch-friendly interface for mobile devices
+- **Image Viewer**: Full-screen image viewing with zoom and pan
+- **Download Support**: Download original images with native file dialog
+
+### GitHub Pages
+1. **Publish Gallery**: Click "Publish to GitHub Pages"
+2. **Monitor Build**: Real-time build status tracking
+3. **Access Site**: Automatic URL generation and browser opening
+
+## 🔍 Error Handling
+
+The application includes comprehensive error handling:
+
+- **Retry Logic**: Automatic retry for transient failures
+- **User-Friendly Messages**: Clear error descriptions
+- **Rate Limit Management**: Automatic rate limit monitoring
+- **Validation**: Input validation with helpful feedback
+
+## 📊 Performance Features
+
+### Caching System
+- **Repository Data**: Cached repository lists and metadata
+- **Image Metadata**: Cached image information for faster loading
+- **Automatic Cleanup**: Expired cache items are automatically removed
+- **Configurable TTL**: Time-to-live settings for different data types
+
+### Batch Operations
+- **Concurrent Uploads**: Multiple images uploaded simultaneously
+- **Efficient API Usage**: Minimized API calls through batching
+- **Memory Management**: Optimized memory usage for large galleries
+
+## 🎨 UI Enhancements
+
+### Modern Design
+- **Dark Theme**: Consistent dark theme throughout
+- **Smooth Animations**: Animated progress bars and transitions
+- **Hover Effects**: Interactive hover states for better UX
+- **Responsive Layout**: Adapts to different window sizes
+
+### Enhanced Components
+- **Status Indicators**: Real-time status and progress information
+- **Loading Spinners**: Visual feedback during operations
+- **Toolbar Organization**: Logical grouping of actions
+- **Image Cards**: Enhanced image display with metadata
+
+## 🔧 Development
+
+### Project Structure
+```
+python-software-memory-uploader/
+├── config.py                 # Configuration management
+├── main.py                   # Main application entry point
+├── services/                 # Service layer
+│   ├── github_service.py    # GitHub API operations
+│   └── image_service.py     # Image processing
+├── utils/                    # Utility modules
+│   ├── error_handler.py     # Error handling and validation
+│   └── cache_manager.py     # Caching system
+├── ui/                       # UI components
+│   └── enhanced_widgets.py  # Enhanced UI widgets
+├── layouts/                  # Layout implementations
+├── requirements.txt          # Python dependencies
+└── README.md                # This file
 ```
 
-3. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
+### Adding New Features
+1. **Service Layer**: Add new services in the `services/` directory
+2. **UI Components**: Create new widgets in `ui/enhanced_widgets.py`
+3. **Configuration**: Add new settings to `config.py`
+4. **Error Handling**: Use the centralized error handling system
 
-4. Create a `.env` file in the project root with your GitHub token:
-```
-GITHUB_TOKEN=your_github_token_here
-```
+## 🐛 Troubleshooting
 
-## Usage
+### Common Issues
+1. **GitHub Token**: Ensure your GitHub token has the necessary permissions
+2. **Rate Limits**: Monitor the rate limit indicator in the status bar
+3. **Image Upload**: Check file formats and sizes
+4. **Cache Issues**: Clear cache if experiencing stale data
 
-1. Run the application:
-```bash
-python main.py
-```
+### Logging
+The application uses comprehensive logging. Log files are stored in the `logs/` directory with timestamps.
 
-2. Create a new repository:
-   - Click the "Create Repository" button
-   - Enter a repository name
-   - Click "Create"
+## 📈 Performance Tips
 
-3. View a repository:
-   - Click the "View" button on any repository card
-   - Use the "Upload Images" button to add new images
-   - Images will be automatically resized and thumbnails will be generated
+1. **Enable Caching**: Keep caching enabled for better performance
+2. **Batch Operations**: Upload multiple images at once
+3. **Monitor Rate Limits**: Avoid hitting GitHub API limits
+4. **Regular Cleanup**: Clear cache periodically for optimal performance
 
-4. Publish to GitHub Pages:
-   - Load a repository with images
-   - Click "Publish to GitHub Pages"
-   - Monitor the build status in real-time
-   - Get notified when your site is ready
-
-5. Check build status:
-   - Use the "Check Build Status" button to manually check current status
-   - View the build status indicator for real-time updates
-
-6. Delete a repository:
-   - Click the "Delete" button on any repository card
-   - Confirm the deletion
-
-## Development
-
-The application is structured into two main components:
-
-1. `main.py`: Contains the main window and repository management functionality
-2. `repository_view.py`: Handles the repository view window and image upload functionality
-
-### Key Components
-
-- **GitHubPagesBuildTracker**: Monitors GitHub Pages build status in a separate thread
-- **Build Status UI**: Real-time status indicators and manual check functionality
-- **Progress Tracking**: Visual feedback during publishing and build processes
-
-## Contributing
+## 🤝 Contributing
 
 1. Fork the repository
 2. Create a feature branch
-3. Commit your changes
-4. Push to the branch
-5. Create a Pull Request
+3. Make your changes
+4. Add tests if applicable
+5. Submit a pull request
 
-## License
+## 📄 License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
+
+## 🙏 Acknowledgments
+
+- PyQt6 for the GUI framework
+- GitHub API for repository management
+- Pillow for image processing
+- All contributors and users of this application
